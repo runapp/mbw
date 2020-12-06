@@ -2,10 +2,19 @@
 NAME=mbw
 TARFILE=${NAME}.tar.gz
 
-mbw: mbw.c
+CC=gcc
+CFLAGS=-g -O3 -static -Wall
+LDFLAGS=-lm
+
+all: mbw mbw-gen
+
+mbw: mbw.o
+
+mbw-gen: mbw-gen.o
 
 clean:
 	rm -f mbw
+	rm -f mbw-gen
 	rm -f ${NAME}.tar.gz
 
 ${TARFILE}: clean
