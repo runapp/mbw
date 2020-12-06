@@ -5,13 +5,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <ctype.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <time.h>
 #include <string.h>
+#include <unistd.h>
+#include <sched.h>
+
+#define PROCMAP_SIZE 4096
 
 /* how many runs to average by default */
 #define DEFAULT_NR_LOOPS 10
@@ -29,6 +33,15 @@
 
 /* version number */
 #define VERSION "1.4"
+
+#define MYMEMSET(a, x, sz)                          \
+    do                                              \
+    {                                               \
+        for (int __memi = 0; __memi < sz; __memi++) \
+        {                                           \
+            ((char *)a)[__memi] = x;                \
+        }                                           \
+    } while (0)
 
 /*
  * MBW memory bandwidth benchmark
@@ -63,6 +76,9 @@ void usage()
     printf("	-t%d: memcpy test with fixed block size\n", TEST_MCBLOCK);
     printf("	-b <size>: block size in bytes for -t2 (default: %d)\n", DEFAULT_BLOCK_SIZE);
     printf("	-q: quiet (print statistics only)\n");
+    printf("	-p: number of worker processes (default to 1)\n");
+    printf("	-r: number of inner repeats on each test round (default to 3)\n");
+    printf("	-f: speecify how each process is pinned in format of 0:3,6,7,8:2:16\n");
     printf("(will then use two arrays, watch out for swapping)\n");
     printf("'Bandwidth' is amount of data copied over the time this operation took.\n");
     printf("\nThe default is to run all tests available.\n");
@@ -101,7 +117,7 @@ long *make_array(unsigned long long asize)
  *
  * return value: elapsed time in seconds
  */
-double worker(unsigned long long asize, long *a, long *b, int type, unsigned long long block_size)
+double worker(unsigned long long asize, long *a, long *b, int type, unsigned long long block_size, int repeats)
 {
     unsigned long long t;
     struct timeval starttime, endtime;
@@ -110,38 +126,36 @@ double worker(unsigned long long asize, long *a, long *b, int type, unsigned lon
     /* array size in bytes */
     unsigned long long array_bytes = asize * long_size;
 
-    if (type == TEST_MEMCPY)
-    { /* memcpy test */
-        /* timer starts */
-        gettimeofday(&starttime, NULL);
-        memcpy(b, a, array_bytes);
-        /* timer stops */
-        gettimeofday(&endtime, NULL);
-    }
-    else if (type == TEST_MCBLOCK)
-    { /* memcpy block test */
-        char *aa = (char *)a;
-        char *bb = (char *)b;
-        gettimeofday(&starttime, NULL);
-        for (t = array_bytes; t >= block_size; t -= block_size, aa += block_size)
-        {
-            bb = mempcpy(bb, aa, block_size);
+    gettimeofday(&starttime, NULL);
+    for (int rep = 0; rep < repeats; rep++)
+    {
+        if (type == TEST_MEMCPY)
+        { /* memcpy test */
+            memcpy(b, a, array_bytes);
         }
-        if (t)
-        {
-            bb = mempcpy(bb, aa, t);
+        else if (type == TEST_MCBLOCK)
+        { /* memcpy block test */
+            char *aa = (char *)a;
+            char *bb = (char *)b;
+            for (t = array_bytes; t >= block_size; t -= block_size, aa += block_size)
+            {
+                bb = mempcpy(bb, aa, block_size);
+            }
+            if (t)
+            {
+                bb = mempcpy(bb, aa, t);
+            }
         }
-        gettimeofday(&endtime, NULL);
-    }
-    else if (type == TEST_DUMB)
-    { /* dumb test */
-        gettimeofday(&starttime, NULL);
-        for (t = 0; t < asize; t++)
-        {
-            b[t] = a[t];
+        else if (type == TEST_DUMB)
+        { /* dumb test */
+            volatile long *va = a, *vb = b;
+            for (t = 0; t < asize; t++)
+            {
+                vb[t] = va[t];
+            }
         }
-        gettimeofday(&endtime, NULL);
     }
+    gettimeofday(&endtime, NULL);
 
     te = ((double)(endtime.tv_sec * 1000000 - starttime.tv_sec * 1000000 + endtime.tv_usec - starttime.tv_usec)) / 1000000;
 
@@ -177,10 +191,65 @@ void printout(double te, double mt, int type)
     return;
 }
 
+double gettimedelta(struct timeval starttime, struct timeval endtime)
+{
+    return ((double)(endtime.tv_sec * 1000000 - starttime.tv_sec * 1000000 + endtime.tv_usec - starttime.tv_usec)) / 1000000;
+}
+
+int parse_cpu_affinity_str(int *cpu_pinno, const char *cpu_pinstr)
+{
+    int *pcpu_pinno = cpu_pinno;
+    const char *p = cpu_pinstr;
+    int start = -1, end = -1, step = -1;
+    while (*p)
+    {
+        int t = 0;
+        while (isdigit(*p))
+        {
+            t = t * 10 + (*p - '0');
+            p++;
+        }
+        if (*p == ':' || *p == ',' || *p == '\0')
+        {
+            if (start == -1)
+            {
+                start = t;
+            }
+            else if (end == -1)
+            {
+                end = t;
+            }
+            else if (step == -1)
+            {
+                step = end;
+                end = t;
+            }
+            else
+                return -1;
+            if (*p != ':')
+            {
+                for (int i = start; i <= end; i += (step >= 1 ? step : 1))
+                    *(++pcpu_pinno) = i;
+                start = end = step = -1;
+            }
+            if (!*p)
+                break;
+            p++;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    return pcpu_pinno - cpu_pinno;
+}
+
 /* ------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
+    int nr_procs = 1;
+    int nr_repeats = 3;
     unsigned int long_size = 0;
     double te, te_sum;            /* time elapsed */
     unsigned long long asize = 0; /* array size (elements in array) */
@@ -188,6 +257,8 @@ int main(int argc, char **argv)
     long *a, *b; /* the two arrays to be copied from/to */
     int o;       /* getopt options */
     unsigned long testno;
+    char *cpu_pinstr = NULL;
+    int cpu_pinno[PROCMAP_SIZE];
 
     /* options */
 
@@ -206,7 +277,9 @@ int main(int argc, char **argv)
     tests[1] = 0;
     tests[2] = 0;
 
-    while ((o = getopt(argc, argv, "haqn:t:b:")) != EOF)
+    memset(cpu_pinno, 0, sizeof(cpu_pinno));
+
+    while ((o = getopt(argc, argv, "haqn:t:b:p:r:f:")) != EOF)
     {
         switch (o)
         {
@@ -240,9 +313,42 @@ int main(int argc, char **argv)
         case 'q': /* quiet */
             quiet = 1;
             break;
+        case 'p': /* no. procs */
+            nr_procs = strtoul(optarg, (char **)NULL, 10);
+            break;
+        case 'r': /* no. repeats */
+            nr_repeats = strtoul(optarg, (char **)NULL, 10);
+            break;
+        case 'f': /* cpu affinity string */
+            cpu_pinstr = (char *)malloc(strlen(optarg) + 2);
+            strcpy(cpu_pinstr, optarg);
+            break;
         default:
             break;
         }
+    }
+
+    {
+        if (!cpu_pinstr)
+        {
+            for (int i = 1; i <= nr_procs; i++)
+            {
+                cpu_pinno[i] = i - 1;
+            }
+        }
+        else
+        {
+            int ret = parse_cpu_affinity_str(cpu_pinno, cpu_pinstr);
+            if (ret != nr_procs)
+            {
+                printf("CPU affinity settings refers to %d CPUs, rather than %d.\n", ret, nr_procs);
+                return 1;
+            }
+        }
+        printf("The workers would be pinned to these cpus:\n");
+        for (int i = 1; i <= nr_procs; i++)
+            printf("%4d", cpu_pinno[i]);
+        printf("\n");
     }
 
     /* default is to run all tests if no specific tests were requested */
@@ -296,37 +402,217 @@ int main(int argc, char **argv)
         }
     }
 
-    a = make_array(asize);
-    b = make_array(asize);
-
     /* ------------------------------------------------------ */
     if (!quiet)
     {
         printf("Getting down to business... Doing %d runs per test.\n", nr_loops);
     }
 
-    /* run all tests requested, the proper number of times */
-    for (testno = 0; testno < MAX_TESTS; testno++)
+    volatile char *procmap = mmap(NULL, PROCMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    MYMEMSET(procmap, 0, PROCMAP_SIZE);
+
+    volatile double(**mpresults)[MAX_TESTS] = NULL;
+    if (nr_loops)
     {
-        te_sum = 0;
-        if (tests[testno])
+        mpresults = malloc(sizeof(void *) * (nr_procs + 1));
+        for (int i = 1; i <= nr_procs; i++)
         {
-            for (i = 0; nr_loops == 0 || i < nr_loops; i++)
-            {
-                te = worker(asize, a, b, testno, block_size);
-                te_sum += te;
-                printf("%d\t", i);
-                printout(te, mt, testno);
-            }
-            if (showavg)
-            {
-                printf("AVG\t");
-                printout(te_sum / nr_loops, mt, testno);
-            }
+            mpresults[i] = (double(*)[MAX_TESTS])mmap(NULL, sizeof(double) * MAX_TESTS * (nr_loops + 1),
+                                                      PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         }
     }
 
-    free(a);
-    free(b);
+    int procno = 0;
+    for (int i = 1; i <= nr_procs; i++)
+    {
+        int forkret = fork();
+        if (forkret == 0)
+        {
+            procno = i;
+            break;
+        }
+        else if (forkret < 0)
+        {
+            MYMEMSET(procmap, -1, PROCMAP_SIZE);
+            perror("error forking workers");
+            exit(1);
+            return 1;
+        }
+    }
+    if (procno <= 0)
+    { // Controller process
+        struct timeval starttime, endtime;
+
+        printf("Ensure all process can respond simultaneously after 1s.\n");
+        usleep(1000000);
+        gettimeofday(&starttime, NULL);
+        for (int i = 1; i <= nr_procs; i++)
+            procmap[i] = 1;
+        for (int i = 1; i <= nr_procs; i++)
+            while (procmap[i] == 1)
+                ;
+        gettimeofday(&endtime, NULL);
+        printf("Syncing all workers cost %4.3lf seconds.\nIf that's too long, the result should be considered unreliable.\n", gettimedelta(starttime, endtime));
+
+        printf("Pre-allocate memory after 1s.\n");
+        usleep(1000000);
+        gettimeofday(&starttime, NULL);
+        for (int i = 1; i <= nr_procs; i++)
+            procmap[i] = 3;
+        for (int i = 1; i <= nr_procs; i++)
+        {
+            while (procmap[i] == 3)
+                ;
+            if (procmap[i] < 0)
+            {
+                MYMEMSET(procmap, -1, PROCMAP_SIZE);
+                printf("Worker %d failed to allocate memory. Exiting...\n", i);
+                exit(1);
+            }
+        }
+        gettimeofday(&endtime, NULL);
+        printf("Pre-allocating memory cost %4.3lf seconds.\n", gettimedelta(starttime, endtime));
+
+        printf("Run tests after 2s.\n");
+        usleep(2000000);
+        gettimeofday(&starttime, NULL);
+        for (int i = 1; i <= nr_procs; i++)
+            procmap[i] = 5;
+        if (!nr_loops)
+            return 0;
+        for (int i = 1; i <= nr_procs; i++)
+            while (procmap[i] == 5)
+                ;
+        gettimeofday(&endtime, NULL);
+        double total_run_time = gettimedelta(starttime, endtime);
+
+        double(*speedsum)[MAX_TESTS] = malloc(sizeof(double) * nr_procs * MAX_TESTS);
+        double(*speedsqsum)[MAX_TESTS] = malloc(sizeof(double) * nr_procs * MAX_TESTS);
+        double *idletime = malloc(sizeof(double) * nr_procs);
+        for (int i = 1; i <= nr_procs; i++)
+        {
+            double worker_run_time = 0;
+            printf("Worker #%d\n", i);
+            for (int testno = 0; testno < MAX_TESTS; testno++)
+            {
+                for (int j = 0; j <= nr_loops; j++)
+                {
+                    printf("%8.3lf\t", mpresults[i][j][testno]);
+                }
+                worker_run_time += mpresults[i][0][testno] * nr_loops;
+                printf("\n");
+            }
+            for (int testno = 0; testno < MAX_TESTS; testno++)
+            {
+                for (int j = 0; j <= nr_loops; j++)
+                {
+                    double speed = mt * nr_repeats / mpresults[i][j][testno];
+                    printf("%8.3lf\t", speed);
+                    if (j)
+                    {
+                        speedsum[i - 1][testno] += speed;
+                        speedsqsum[i - 1][testno] += speed * speed;
+                    }
+                }
+                printf("\n");
+            }
+            idletime[i - 1] = total_run_time - worker_run_time;
+            printf("Worker idle time: %8.3lf\n", idletime[i - 1]);
+        }
+
+        {
+            printf("\nSpeed, std-dev and idletime:\n");
+            for (int testno = 0; testno < MAX_TESTS; testno++)
+            {
+                for (int i = 0; i < nr_procs; i++)
+                {
+                    printf(" %7.2lf", speedsum[i][testno] / nr_loops);
+                }
+                printf(" ");
+                for (int i = 0; i < nr_procs; i++)
+                {
+                    double std_dev = nr_procs > 1 ? (speedsqsum[i][testno] - speedsum[i][testno] * speedsum[i][testno] / nr_loops) / (nr_procs - 1) : 0;
+                    printf(" %7.2lf", std_dev);
+                }
+                printf("\n");
+            }
+            for (int testno = 0; testno < MAX_TESTS; testno++)
+            {
+                double sum = 0, sumsq = 0;
+                for (int i = 0; i < nr_procs; i++)
+                {
+                    sum += speedsum[i][testno];
+                    sumsq += speedsqsum[i][testno];
+                }
+                double std_dev = nr_procs > 1 ? (sumsq - sum * sum / nr_loops) / (nr_procs - 1) : 0;
+                printf("%7.2lf %7.2lf   ", sum, std_dev);
+            }
+            printf("\n");
+            for (int i = 0; i < nr_procs; i++)
+            {
+                printf(" %7.2lf", idletime[i]);
+            }
+            printf("\n");
+        }
+        printf("All tests done in %10.3lf seconds\n\n", total_run_time);
+    }
+    else
+    { // Worker process
+        cpu_set_t cur_proc_cpu_set;
+        CPU_ZERO(&cur_proc_cpu_set);
+        CPU_SET(cpu_pinno[procno], &cur_proc_cpu_set);
+        sched_setaffinity(0, sizeof(cur_proc_cpu_set), &cur_proc_cpu_set);
+        while (procmap[procno] == 0)
+            ;
+        if (procmap[procno] < 0)
+            exit(1);
+        //We expect procmap[procno]==1 here.
+        procmap[procno] = 2;
+        while (procmap[procno] == 2)
+            ;
+        if (procmap[procno] < 0)
+            exit(1);
+        a = make_array(asize);
+        b = make_array(asize);
+        procmap[procno] = 4;
+        while (procmap[procno] == 4)
+            ;
+        if (procmap[procno] < 0)
+            exit(1);
+
+        double(*results)[MAX_TESTS] = NULL;
+        if (nr_loops)
+            results = (double(*))mpresults[procno];
+        /* run all tests requested, the proper number of times */
+        for (testno = 0; testno < MAX_TESTS; testno++)
+        {
+            te_sum = 0;
+            if (tests[testno])
+            {
+                for (i = 0; nr_loops == 0 || i < nr_loops; i++)
+                {
+                    te = worker(asize, a, b, testno, block_size, nr_repeats);
+                    te_sum += te;
+                    if (!quiet)
+                    {
+                        printf("worker %d\t%d\t", procno, i);
+                        printout(te, mt * nr_repeats, testno);
+                    }
+                    //putchar('.');
+                    if (nr_loops)
+                        results[i + 1][testno] = te;
+                }
+                if (showavg && !quiet)
+                {
+                    printf("worker %d\tAVG\t", procno);
+                    printout(te_sum / nr_loops, mt * nr_repeats, testno);
+                }
+                results[0][testno] = te_sum / nr_loops;
+            }
+        }
+        procmap[procno] = 6;
+        exit(0);
+    }
+
     return 0;
 }
