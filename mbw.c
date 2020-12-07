@@ -6,12 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <math.h>
+#include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <time.h>
-#include <string.h>
 #include <unistd.h>
 #include <sched.h>
 
@@ -504,6 +505,8 @@ int main(int argc, char **argv)
             }
             for (int testno = 0; testno < MAX_TESTS; testno++)
             {
+                speedsum[i - 1][testno] = 0;
+                speedsqsum[i - 1][testno] = 0;
                 for (int j = 0; j <= nr_loops; j++)
                 {
                     double speed = mt * nr_repeats / mpresults[i][j][testno];
@@ -528,14 +531,26 @@ int main(int argc, char **argv)
                 {
                     printf(" %7.2lf", speedsum[i][testno] / nr_loops);
                 }
-                printf(" ");
+                printf(" |");
                 for (int i = 0; i < nr_procs; i++)
                 {
-                    double std_dev = nr_procs > 1 ? (speedsqsum[i][testno] - speedsum[i][testno] * speedsum[i][testno] / nr_loops) / (nr_procs - 1) : 0;
+                    double std_dev = nr_procs > 1 ? sqrt((speedsqsum[i][testno] - speedsum[i][testno] * speedsum[i][testno] / nr_loops) / (nr_procs - 1)) : 0;
                     printf(" %7.2lf", std_dev);
                 }
                 printf("\n");
             }
+            /*
+            printf("debug:\n");
+            for (int testno = 0; testno < MAX_TESTS; testno++)
+            {
+                for (int i = 0; i < nr_procs; i++)
+                {
+                    printf("  speedsum[%d][%d]=%7.2lf\n", i, testno, speedsum[i][testno]);
+                    printf("  speedssq[%d][%d]=%7.2lf\n", i, testno, speedsqsum[i][testno]);
+                }
+            }
+            */
+            printf("\nTotal speed:\n");
             for (int testno = 0; testno < MAX_TESTS; testno++)
             {
                 double sum = 0, sumsq = 0;
@@ -544,7 +559,7 @@ int main(int argc, char **argv)
                     sum += speedsum[i][testno];
                     sumsq += speedsqsum[i][testno];
                 }
-                double std_dev = nr_procs > 1 ? (sumsq - sum * sum / nr_loops) / (nr_procs - 1) : 0;
+                double std_dev = nr_procs > 1 ? sqrt((sumsq - sum * sum / (nr_loops * nr_procs)) / (nr_procs - 1)) : 0;
                 printf("%7.2lf %7.2lf   ", sum, std_dev);
             }
             printf("\n");
